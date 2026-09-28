@@ -124,8 +124,9 @@ CLINE_PROXY_HOST=0.0.0.0 ./cline-proxy
 
 Direct requests to the Cline upstream (`api.cline.bot` / `api.workos.com`) may be region-restricted from mainland China. Configure an **application-level egress proxy** in the admin panel without enabling TUN mode on the host:
 
-- **Cline egress proxy**: open **Upstreams → Cline Egress Proxies**, enter one proxy URL per line (`http`, `https`, `socks5`, or `socks5h`; for example `socks5://127.0.0.1:1080`). Cline requests (chat, login/token refresh, and model sync) use the configured pool with round-robin, random, or fill strategy. The setting is stored in `.cline-proxy.json` and takes effect immediately.
-- **OpenCode egress proxy**: the OpenCode Zen section has a separate proxy pool for the opencode upstream and automatically cools down rate-limited exits.
+- **Cline egress proxy**: open **Upstreams → Cline Egress Proxies**, enter one proxy URL per line (`http`, `https`, `socks5`, or `socks5h`; for example `socks5://127.0.0.1:1080`). Cline requests (chat, login/token refresh, and model sync) use the configured pool with round-robin, random, fill, or Resin strategy. The setting is stored in `.cline-proxy.json` and takes effect immediately.
+- **OpenCode egress proxy**: the OpenCode Zen section has an independent proxy pool for the opencode upstream. Static exits are cooled down when rate-limited; Resin mode generates a fresh session exit for every request and retry.
+- **Resin templates**: select the `resin` strategy independently for either pool and include `{uuid}` or `{uuid_hex}` in the proxy username, for example `http://node.{uuid}:password@127.0.0.1:9200`. Each request uses a temporary connection that is closed with the response so dynamic sessions do not accumulate in a client pool.
 
 Priority: application proxy > environment proxy (`HTTPS_PROXY`) > direct connection. Loopback and private-network targets (such as a local Ollama or custom Provider) always connect directly.
 

@@ -126,8 +126,9 @@ CLINE_PROXY_HOST=0.0.0.0 ./cline-proxy
 
 国内直连 Cline 上游（`api.cline.bot` / `api.workos.com`）会命中跨区限制，本工具支持在管理后台配置**应用内出口代理**，无需在主机开 TUN：
 
-- **Cline 出口代理**：管理后台「上游服务 → Cline 出口代理」，填入代理列表（每行一个，支持 `http` / `https` / `socks5` / `socks5h`，如 `socks5://127.0.0.1:1080`），所有发往 Cline 的请求（对话、登录/令牌刷新、模型同步）经代理池按策略（轮询 / 随机 / 填满）轮询出去。配置持久化在 `.cline-proxy.json`，保存即生效，无需重启。
-- **opencode 出口代理**：同一页面的 opencode Zen 区块，为 opencode（zen）上游单独配置代理池，命中限流时自动冷却当前出口。
+- **Cline 出口代理**：管理后台「上游服务 → Cline 出口代理」，填入代理列表（每行一个，支持 `http` / `https` / `socks5` / `socks5h`，如 `socks5://127.0.0.1:1080`），所有发往 Cline 的请求（对话、登录/令牌刷新、模型同步）经代理池按策略（轮询 / 随机 / 填满 / Resin）出去。配置持久化在 `.cline-proxy.json`，保存即生效，无需重启。
+- **opencode 出口代理**：同一页面的 opencode Zen 区块，为 opencode（zen）上游配置独立代理池，命中限流时冷却当前静态出口；选择 Resin 策略时，每次请求和重试都会从模板生成新的会话出口。
+- **Resin 模板**：两套代理配置相互独立，策略选择 `resin` 后，代理用户名必须包含 `{uuid}` 或 `{uuid_hex}`，例如 `http://node.{uuid}:password@127.0.0.1:9200`。每个请求使用独立临时连接，响应结束后关闭，避免动态会话积累连接池。
 
 优先级：应用内代理 > 环境变量代理（`HTTPS_PROXY`）> 直连。回环 / 内网目标（如本机 Ollama 等自定义 Provider）始终直连，不经代理。
 

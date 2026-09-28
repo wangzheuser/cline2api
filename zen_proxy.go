@@ -47,29 +47,38 @@ func getZenHTTPClient() *http.Client {
 func rebuildZenTransport() {
 	zenTransportMu.Lock()
 	defer zenTransportMu.Unlock()
+	if old, ok := zenHTTPClient.Transport.(interface{ CloseIdleConnections() }); ok {
+		old.CloseIdleConnections()
+	}
 	zenHTTPClient = &http.Client{Transport: buildZenTransport()}
 }
 
 func buildZenTransport() *http.Transport {
+	t, _ := buildZenTransportWithDial(zenDialContext)
+	return t
+}
+
+func buildZenTransportWithDial(dial func(context.Context, string, string) (net.Conn, error)) (*http.Transport, *http2.Transport) {
 	t := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	t.DialContext = zenDialContext
+	t.DialContext = dial
 	// https 走 uTLS Chrome 指纹 + HTTP/2（完整浏览器指纹含 h2）
-	t.RegisterProtocol("https", zenHTTP2Transport())
-	return t
+	h2 := zenHTTP2Transport(dial)
+	t.RegisterProtocol("https", h2)
+	return t, h2
 }
 
 // zenTLSHandshakeTimeout 限制 TLS 握手时长：GFW 式黑洞（TCP 通、TLS 静默丢弃）
 // 会让无超时的握手永久挂起，请求既不失败也不返回（故障转移也无法激活）。
 const zenTLSHandshakeTimeout = 15 * time.Second
 
-func zenHTTP2Transport() *http2.Transport {
+func zenHTTP2Transport(dial func(context.Context, string, string) (net.Conn, error)) *http2.Transport {
 	return &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			raw, err := zenDialContext(ctx, network, addr)
+			raw, err := dial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -107,6 +116,52 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	return dialViaProxy(ctx, p, network, addr)
 }
 
+type zenRequestTransport struct {
+	client        *http.Client
+	cleanup       func()
+	via           string
+	resin         bool
+	templateIndex int
+}
+
+// zenTransportForRequest isolates Resin sessions to one upstream request. A
+// fresh transport is required because an existing HTTP/2 CONNECT tunnel would
+// otherwise keep using the previous Resin identity and exit.
+func zenTransportForRequest() (*zenRequestTransport, error) {
+	cfg := getZenConfig()
+	if cfg.ProxyStrategy != resinProxyStrategy || len(cfg.Proxies) == 0 {
+		return &zenRequestTransport{
+			client:  getZenHTTPClient(),
+			cleanup: func() {},
+			via:     describeZenProxy(),
+		}, nil
+	}
+
+	idx := int(zenProxyCount.Add(1)-1) % len(cfg.Proxies)
+	rendered, err := renderProxyTemplate(cfg.Proxies[idx])
+	if err != nil {
+		return nil, err
+	}
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialViaProxy(ctx, rendered, network, addr)
+	}
+	transport, h2 := buildZenTransportWithDial(dial)
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			transport.CloseIdleConnections()
+			h2.CloseIdleConnections()
+		})
+	}
+	return &zenRequestTransport{
+		client:        &http.Client{Transport: transport},
+		cleanup:       cleanup,
+		via:           fmt.Sprintf("resin[%d]=%s", idx+1, truncate(maskProxyURL(rendered), 80)),
+		resin:         true,
+		templateIndex: idx,
+	}, nil
+}
+
 // pickZenProxy 按策略选代理，返回 (代理URL, 索引)；未配置返回 ("", -1)。
 // 冷却中的代理线性探测跳过；轮询计数与日志索引保持一致。
 func pickZenProxy() (string, int) {
@@ -121,6 +176,8 @@ func pickZenProxy() (string, int) {
 		idx = randIntn(n)
 	case "fill":
 		idx = 0
+	case resinProxyStrategy:
+		// Resin templates rotate by rendered username, not by static URL cooldown.
 	}
 	for i := 0; i < n; i++ {
 		if zenProxyAvailable(idx) {
@@ -128,7 +185,15 @@ func pickZenProxy() (string, int) {
 		}
 		idx = (idx + 1) % n
 	}
-	return cfg.Proxies[idx], idx
+	selected := cfg.Proxies[idx]
+	if cfg.ProxyStrategy == resinProxyStrategy {
+		rendered, err := renderProxyTemplate(selected)
+		if err != nil {
+			return "", -1
+		}
+		selected = rendered
+	}
+	return selected, idx
 }
 
 // lastZenProxyIdx 最近一次实际使用的代理索引（日志/冷却定位用）。
@@ -186,11 +251,24 @@ func zenProxyCooldownStatus() map[string]string {
 }
 
 func maskProxyURL(raw string) string {
+	if hasProxyTemplate(raw) {
+		schemeEnd := strings.Index(raw, "://")
+		authorityStart := schemeEnd + 3
+		at := strings.LastIndex(raw[authorityStart:], "@")
+		userinfo := raw[authorityStart : authorityStart+at]
+		username := strings.SplitN(userinfo, ":", 2)[0]
+		return raw[:authorityStart] + username + ":***@" + raw[authorityStart+at+1:]
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.User == nil {
 		return raw
 	}
-	u.User = url.User("***")
+	username := u.User.Username()
+	if strings.Contains(username, "{uuid}") || strings.Contains(username, "{uuid_hex}") || strings.HasPrefix(username, "node.") {
+		u.User = url.UserPassword(username, "***")
+	} else {
+		u.User = url.User("***")
+	}
 	return u.String()
 }
 

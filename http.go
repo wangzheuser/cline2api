@@ -26,7 +26,7 @@ var httpTransport = &http.Transport{
 }
 
 var httpClient = &http.Client{
-	Transport: httpTransport,
+	Transport: &clineProxyRoundTripper{base: httpTransport},
 	// 上游整体兜底超时：流式响应的首字节通常远早于此，流本身不受此限制影响；
 	// 非流式请求（如探活）在极端排队时不会无限挂起。
 	Timeout: 5 * time.Minute,

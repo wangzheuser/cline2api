@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -25,7 +26,7 @@ import (
 
 type clineProxyConfigData struct {
 	Proxies       []string `json:"proxies"`
-	ProxyStrategy string   `json:"proxyStrategy"` // round_robin / random / fill
+	ProxyStrategy string   `json:"proxyStrategy"` // round_robin / random / fill / resin
 }
 
 var (
@@ -97,7 +98,7 @@ func normalizeClineProxyConfig(c *clineProxyConfigData) {
 		}
 	}
 	c.Proxies = cleaned
-	if c.ProxyStrategy != "random" && c.ProxyStrategy != "fill" {
+	if !proxyStrategyValid(c.ProxyStrategy) {
 		c.ProxyStrategy = "round_robin"
 	}
 }
@@ -139,8 +140,67 @@ func pickFromClineProxies(proxies []string, strategy string) string {
 		idx = randIntn(n)
 	case "fill":
 		idx = 0
+	case resinProxyStrategy:
+		// Resin selects a template in round-robin order, then renders a fresh
+		// sticky identity for this request.
 	}
-	return proxies[idx]
+	selected := proxies[idx]
+	if strategy == resinProxyStrategy {
+		rendered, err := renderProxyTemplate(selected)
+		if err != nil {
+			return ""
+		}
+		selected = rendered
+	}
+	return selected
+}
+
+type clineProxyRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (t *clineProxyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	proxies, strategy := snapshotClineProxyConfig()
+	if strategy != resinProxyStrategy || len(proxies) == 0 || clineDirectRequest(req) {
+		return t.base.RoundTrip(req)
+	}
+	proxyURL := pickFromClineProxies(proxies, strategy)
+	if proxyURL == "" {
+		return nil, fmt.Errorf("render Resin proxy template")
+	}
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialViaProxy(ctx, proxyURL, network, addr)
+		},
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 15 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		transport.CloseIdleConnections()
+		return nil, err
+	}
+	resp.Body = &cleanupReadCloser{ReadCloser: resp.Body, cleanup: transport.CloseIdleConnections}
+	return resp, nil
+}
+
+func clineDirectRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	host := req.URL.Host
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "443"
+		if req.URL.Scheme == "http" {
+			port = "80"
+		}
+		host = net.JoinHostPort(req.URL.Hostname(), port)
+	}
+	return clineDirectDialHost(host)
 }
 
 // clineEnvProxy 环境变量代理回退（可注入接缝，测试用替身避免污染

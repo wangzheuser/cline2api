@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +45,22 @@ func TestClineProxyConfigNormalize(t *testing.T) {
 	}
 	if cfg.ProxyStrategy != "round_robin" {
 		t.Fatalf("bogus strategy should fall back to round_robin, got %q", cfg.ProxyStrategy)
+	}
+}
+
+func TestClineProxyConfigKeepsResinStrategy(t *testing.T) {
+	cfg := &clineProxyConfigData{
+		Proxies:       []string{"http://node.{uuid}:secret@127.0.0.1:9200"},
+		ProxyStrategy: resinProxyStrategy,
+	}
+	normalizeClineProxyConfig(cfg)
+	if cfg.ProxyStrategy != resinProxyStrategy {
+		t.Fatalf("Resin strategy changed to %q", cfg.ProxyStrategy)
+	}
+	first := pickFromClineProxies(cfg.Proxies, cfg.ProxyStrategy)
+	second := pickFromClineProxies(cfg.Proxies, cfg.ProxyStrategy)
+	if first == second || strings.Contains(first, "{uuid}") || strings.Contains(second, "{uuid}") {
+		t.Fatalf("Resin strategy did not render fresh sessions: %q / %q", maskProxyURL(first), maskProxyURL(second))
 	}
 }
 

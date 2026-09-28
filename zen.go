@@ -249,7 +249,7 @@ type zenConfigData struct {
 	Key             string   `json:"key"`
 	BaseURL         string   `json:"baseURL"`
 	Proxies         []string `json:"proxies"`
-	ProxyStrategy   string   `json:"proxyStrategy"` // round_robin / random / fill
+	ProxyStrategy   string   `json:"proxyStrategy"` // round_robin / random / fill / resin
 	MaxConcurrency  int      `json:"maxConcurrency"`
 	Retries         int      `json:"retries"`
 	Failover        bool     `json:"failover"`
@@ -303,7 +303,7 @@ func getZenConfig() *zenConfigData {
 		if cfg.BaseURL == "" {
 			cfg.BaseURL = zenAPIBase
 		}
-		if cfg.ProxyStrategy != "random" && cfg.ProxyStrategy != "fill" {
+		if !proxyStrategyValid(cfg.ProxyStrategy) {
 			cfg.ProxyStrategy = "round_robin"
 		}
 		zenConfig = cfg
@@ -320,7 +320,7 @@ func setZenConfig(c *zenConfigData) {
 	if c.Key == "" {
 		c.Key = "public"
 	}
-	if c.ProxyStrategy != "round_robin" && c.ProxyStrategy != "random" && c.ProxyStrategy != "fill" {
+	if !proxyStrategyValid(c.ProxyStrategy) {
 		c.ProxyStrategy = "round_robin"
 	}
 	if c.MaxConcurrency <= 0 {
@@ -443,20 +443,28 @@ func validateProxyList(proxies []string) error {
 		if line == "" {
 			continue
 		}
-		u, err := url.Parse(line)
+		parseTarget := line
+		if hasProxyTemplate(line) {
+			var err error
+			parseTarget, err = renderProxyTemplate(line)
+			if err != nil {
+				return fmt.Errorf("proxy %q invalid: %v", maskProxyURL(line), err)
+			}
+		}
+		u, err := url.Parse(parseTarget)
 		if err != nil {
-			return fmt.Errorf("proxy %q invalid: %v", line, err)
+			return fmt.Errorf("proxy %q invalid: %v", maskProxyURL(line), err)
 		}
 		switch u.Scheme {
 		case "http", "https", "socks5", "socks5h":
 		default:
-			return fmt.Errorf("proxy %q: unsupported scheme (http/https/socks5/socks5h)", line)
+			return fmt.Errorf("proxy %q: unsupported scheme (http/https/socks5/socks5h)", maskProxyURL(line))
 		}
 		if u.Host == "" {
-			return fmt.Errorf("proxy %q: missing host:port", line)
+			return fmt.Errorf("proxy %q: missing host:port", maskProxyURL(line))
 		}
 		if _, _, err := net.SplitHostPort(u.Host); err != nil {
-			return fmt.Errorf("proxy %q: missing port", line)
+			return fmt.Errorf("proxy %q: missing port", maskProxyURL(line))
 		}
 	}
 	return nil
@@ -714,8 +722,13 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 	delay := time.Second
 
 	for attempt := 0; ; attempt++ {
+		requestTransport, err := zenTransportForRequest()
+		if err != nil {
+			return nil, fmt.Errorf("prepare zen transport: %w", err)
+		}
 		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
+			requestTransport.cleanup()
 			return nil, fmt.Errorf("create zen request: %w", err)
 		}
 		sess := zenSessionID(params)
@@ -752,7 +765,7 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 			}
 		}
 		log.Printf("  zen upstream: model=%v stream=%v(下游=%v) msgs=%d via=%s attempt=%d session=%s",
-			bodyParamsModel(params), anonymous, stream, getMsgCount(params), describeZenProxy(), attempt+1, truncate(sess, 30))
+			bodyParamsModel(params), anonymous, stream, getMsgCount(params), requestTransport.via, attempt+1, truncate(sess, 30))
 
 		// 响应头看门狗：黑洞场景（TCP 通、握手/响应头静默丢弃）请求会永久挂起，
 		// 且 callZenAPI 不返回则 markZenFail 不触发、故障转移永远无法激活。
@@ -762,8 +775,9 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 		watchdog := time.AfterFunc(zenHeaderWatchdogTimeout, watchCancel)
 		req = req.WithContext(watchCtx)
 
-		resp, err := getZenHTTPClient().Do(req)
+		resp, err := requestTransport.client.Do(req)
 		if err != nil {
+			requestTransport.cleanup()
 			watchdog.Stop()
 			watchCancel()
 			// 网络错误：退避重试；重试耗尽计一次失败（网络类故障也参与故障转移，
@@ -784,6 +798,7 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 			return nil, msg
 		}
 		watchdog.Stop()
+		resp.Body = &cleanupReadCloser{ReadCloser: resp.Body, cleanup: requestTransport.cleanup}
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
 			if anonymous && !stream {
@@ -814,7 +829,7 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 			ra := parseRetryAfter(resp.Header.Get("Retry-After"))
 			// 冷却当前出口代理（Retry-After 优先，默认 10 分钟，封顶 30 分钟）：
 			// 单个本地代理端口背后可切换节点（出口 IP 变化），长冷却有害无益
-			if idx := lastZenProxyIdx(); idx >= 0 {
+			if idx := lastZenProxyIdx(); idx >= 0 && !requestTransport.resin {
 				d := ra
 				if d <= 0 {
 					d = 10 * time.Minute
@@ -826,6 +841,10 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 			}
 			// 短限流（≤60s）值得按 Retry-After 等待重试；
 			// 长限流（实测可达 13h）重试无意义，立即失败触发故障转移
+			if attempt < retries && requestTransport.resin {
+				log.Printf("  zen resin exit limited (%d), rotating session (%d/%d)", resp.StatusCode, attempt+1, retries)
+				continue
+			}
 			if attempt < retries && ra > 0 && ra <= zenMaxRetryWait {
 				log.Printf("  zen rate limited (%d), retry %d/%d after %v", resp.StatusCode, attempt+1, retries, ra)
 				time.Sleep(withRetryJitter(ra))
@@ -1074,7 +1093,12 @@ func syncZenModels() modelSyncResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
-	resp, err := getZenHTTPClient().Do(req)
+	requestTransport, err := zenTransportForRequest()
+	if err != nil {
+		return fail(err)
+	}
+	defer requestTransport.cleanup()
+	resp, err := requestTransport.client.Do(req)
 	if err != nil {
 		return fail(err)
 	}

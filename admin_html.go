@@ -770,13 +770,14 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
             <option value="round_robin">轮询 (round_robin)</option>
             <option value="random">随机 (random)</option>
             <option value="fill">填满 (fill)</option>
+            <option value="resin">Resin 代理池 (resin)</option>
           </select>
         </div>
         <div class="field" style="flex:1"><label>出口冷却状态</label><div id="ocProxyCooldowns" style="font-size:12px;color:var(--text3)">-</div></div>
       </div>
       <div class="field" style="margin-top:10px">
         <label>代理列表</label>
-        <textarea id="ocProxies" rows="4" style="width:100%;font-family:ui-monospace,monospace;font-size:12px;border:1px solid var(--border2);border-radius:8px;padding:8px;background:var(--surface);color:var(--text)" placeholder="socks5://127.0.0.1:1080&#10;http://user:pass@proxy.example.com:8080"></textarea>
+        <textarea id="ocProxies" rows="4" style="width:100%;font-family:ui-monospace,monospace;font-size:12px;border:1px solid var(--border2);border-radius:8px;padding:8px;background:var(--surface);color:var(--text)" placeholder="socks5://127.0.0.1:1080&#10;http://node.{uuid}:password@127.0.0.1:9200"></textarea>
       </div>
     </div>
   </div>
@@ -795,12 +796,13 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
             <option value="round_robin">轮询 (round_robin)</option>
             <option value="random">随机 (random)</option>
             <option value="fill">填满 (fill)</option>
+            <option value="resin">Resin 代理池 (resin)</option>
           </select>
         </div>
       </div>
       <div class="field" style="margin-top:10px">
         <label>代理列表</label>
-        <textarea id="clineProxies" rows="4" style="width:100%;font-family:ui-monospace,monospace;font-size:12px;border:1px solid var(--border2);border-radius:8px;padding:8px;background:var(--surface);color:var(--text)" placeholder="socks5://127.0.0.1:1080&#10;http://user:pass@proxy.example.com:8080"></textarea>
+        <textarea id="clineProxies" rows="4" style="width:100%;font-family:ui-monospace,monospace;font-size:12px;border:1px solid var(--border2);border-radius:8px;padding:8px;background:var(--surface);color:var(--text)" placeholder="socks5://127.0.0.1:1080&#10;http://node.{uuid}:password@127.0.0.1:9200"></textarea>
       </div>
       <div class="form-actions" style="margin-top:14px">
         <button class="btn btn-primary" onclick="saveClineProxyConfig()">保存 Cline 代理</button>
@@ -1300,6 +1302,7 @@ const I18N = {
   'JSON 数组格式：[{"refreshToken":"...","email":"..."}]': 'JSON array format: [{"refreshToken":"...","email":"..."}]',
   'API Key: <生成的密钥>': 'API Key: <generated key>',
   '代理策略': 'Proxy strategy',
+  'Resin 代理池 (resin)': 'Resin proxy pool (resin)',
   '自定义 Provider（OpenAI 兼容）': 'Custom Providers (OpenAI-compatible)',
   '批量编辑': 'Bulk Edit',
   '批量编辑（每行 Key: Value）': 'Bulk edit (one Key: Value per line)',

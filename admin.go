@@ -1483,11 +1483,17 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := getZenConfig()
+	updated := *cfg
+	updated.Proxies = append([]string(nil), cfg.Proxies...)
+	updated.ZenHeaders = make(map[string]string, len(cfg.ZenHeaders))
+	for k, v := range cfg.ZenHeaders {
+		updated.ZenHeaders[k] = v
+	}
 	if req.Enabled != nil {
-		cfg.Enabled = *req.Enabled
+		updated.Enabled = *req.Enabled
 	}
 	if req.Key != nil {
-		cfg.Key = strings.TrimSpace(*req.Key)
+		updated.Key = strings.TrimSpace(*req.Key)
 	}
 	if req.BaseURL != nil {
 		u := strings.TrimSpace(*req.BaseURL)
@@ -1495,25 +1501,26 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_base_url")})
 			return
 		}
-		cfg.BaseURL = u
+		updated.BaseURL = u
 	}
 	if req.Proxies != nil {
-		if err := validateProxyList(req.Proxies); err != nil {
+		restored := restoreMaskedProxyList(req.Proxies, cfg.Proxies)
+		if err := validateProxyList(restored); err != nil {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
 			return
 		}
 		var cleaned []string
-		for _, p := range req.Proxies {
+		for _, p := range restored {
 			if line := strings.TrimSpace(p); line != "" {
 				cleaned = append(cleaned, line)
 			}
 		}
-		cfg.Proxies = cleaned
+		updated.Proxies = cleaned
 	}
 	if req.ProxyStrategy != nil {
 		switch *req.ProxyStrategy {
-		case "round_robin", "random", "fill":
-			cfg.ProxyStrategy = *req.ProxyStrategy
+		case "round_robin", "random", "fill", resinProxyStrategy:
+			updated.ProxyStrategy = *req.ProxyStrategy
 		default:
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_proxy_strategy")})
 			return
@@ -1524,31 +1531,31 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_concurrency")})
 			return
 		}
-		cfg.MaxConcurrency = *req.MaxConcurrency
+		updated.MaxConcurrency = *req.MaxConcurrency
 	}
 	if req.Retries != nil {
 		if *req.Retries < 0 || *req.Retries > 10 {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_retries")})
 			return
 		}
-		cfg.Retries = *req.Retries
+		updated.Retries = *req.Retries
 	}
 	if req.Failover != nil {
-		cfg.Failover = *req.Failover
+		updated.Failover = *req.Failover
 	}
 	if req.FailoverCount != nil {
 		if *req.FailoverCount < 1 || *req.FailoverCount > 20 {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_failover")})
 			return
 		}
-		cfg.FailoverCount = *req.FailoverCount
+		updated.FailoverCount = *req.FailoverCount
 	}
 	if req.FailoverMinutes != nil {
 		if *req.FailoverMinutes < 1 || *req.FailoverMinutes > 120 {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_failover")})
 			return
 		}
-		cfg.FailoverMinutes = *req.FailoverMinutes
+		updated.FailoverMinutes = *req.FailoverMinutes
 	}
 	if req.ZenHeaders != nil {
 		cleaned := map[string]string{}
@@ -1559,7 +1566,7 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			cleaned[k] = strings.TrimSpace(v)
 		}
-		cfg.ZenHeaders = cleaned
+		updated.ZenHeaders = cleaned
 	}
 	if req.Compaction != nil {
 		c := req.Compaction
@@ -1567,15 +1574,19 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_compaction")})
 			return
 		}
-		cfg.Compaction.Auto = c.Auto
-		cfg.Compaction.Buffer = c.Buffer
-		cfg.Compaction.KeepTokens = c.KeepTokens
-		cfg.Compaction.SummaryModel = strings.TrimSpace(c.SummaryModel)
-		cfg.Compaction.MaxSummary = c.MaxSummary
+		updated.Compaction.Auto = c.Auto
+		updated.Compaction.Buffer = c.Buffer
+		updated.Compaction.KeepTokens = c.KeepTokens
+		updated.Compaction.SummaryModel = strings.TrimSpace(c.SummaryModel)
+		updated.Compaction.MaxSummary = c.MaxSummary
 	}
 
-	setZenConfig(cfg)
-	log.Printf("admin: opencode config updated (enabled=%v)", cfg.Enabled)
+	if err := validateResinProxyTemplates(updated.ProxyStrategy, updated.Proxies); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	setZenConfig(&updated)
+	log.Printf("admin: opencode config updated (enabled=%v)", updated.Enabled)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "opencode_config_saved")})
 }
 
@@ -1619,6 +1630,7 @@ func handleClineProxyConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Proxies != nil {
+		req.Proxies = restoreMaskedProxyList(req.Proxies, getClineProxyConfig().Proxies)
 		if err := validateProxyList(req.Proxies); err != nil {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
 			return
@@ -1634,12 +1646,16 @@ func handleClineProxyConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ProxyStrategy != nil {
 		switch *req.ProxyStrategy {
-		case "round_robin", "random", "fill":
+		case "round_robin", "random", "fill", resinProxyStrategy:
 			updated.ProxyStrategy = *req.ProxyStrategy
 		default:
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_proxy_strategy")})
 			return
 		}
+	}
+	if err := validateResinProxyTemplates(updated.ProxyStrategy, updated.Proxies); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
 	}
 	setClineProxyConfig(updated)
 	if err := getClineProxyPersistErr(); err != nil {
