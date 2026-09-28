@@ -13,6 +13,12 @@ import (
 	"time"
 )
 
+type resinRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f resinRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestRenderProxyTemplateCreatesFreshSession(t *testing.T) {
 	template := "http://node.{uuid}:secret@127.0.0.1:9200"
 	first, err := renderProxyTemplate(template)
@@ -171,5 +177,35 @@ func TestZenResinTransportIsRequestScoped(t *testing.T) {
 	defer second.cleanup()
 	if !first.resin || !second.resin || first.client == second.client || first.via == second.via {
 		t.Fatalf("expected request-scoped Resin transports: first=%q second=%q", first.via, second.via)
+	}
+}
+
+func TestClineModelSyncRotatesResinExit(t *testing.T) {
+	setClineProxyTestConfig(t, []string{"http://node.{uuid}:secret@127.0.0.1:9200"}, resinProxyStrategy)
+	oldTransport := httpClient.Transport
+	t.Cleanup(func() { httpClient.Transport = oldTransport })
+	calls := 0
+	httpClient.Transport = resinRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		status := http.StatusForbidden
+		body := `{}`
+		if calls == 2 {
+			status = http.StatusOK
+			body = `{"free":[{"id":"test/free","tags":["FREE"]}]}`
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	data, err := fetchClineRecommendedModels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(data.Free) != 1 || data.Free[0].ID != "test/free" {
+		t.Fatalf("expected one rotated retry, calls=%d data=%+v", calls, data)
 	}
 }

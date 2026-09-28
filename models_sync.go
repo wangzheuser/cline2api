@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -46,38 +47,51 @@ type modelSyncResult struct {
 }
 
 var (
-	modelSyncMu    sync.Mutex
-	lastModelSync  modelSyncResult
-	modelSyncRan   bool // 启动后是否已同步过（避免重复）
-	modelSyncBusy  bool // 同步进行中（防并发触发）
+	modelSyncMu   sync.Mutex
+	lastModelSync modelSyncResult
+	modelSyncRan  bool // 启动后是否已同步过（避免重复）
+	modelSyncBusy bool // 同步进行中（防并发触发）
 )
 
 // remoteModelsEnabled 远程同步成功后置 true：此后 getAllModels 以远程模型为主，
 // 内置硬编码模型（已失效）仅作为离线 fallback。
 var (
-	remoteModelsEnabled bool
+	remoteModelsEnabled   bool
 	remoteModelsEnabledMu sync.Mutex
 )
 
 // fetchClineRecommendedModels 拉取并解析 Cline 官方推荐模型接口。
 func fetchClineRecommendedModels() (clineRecommendedResponse, error) {
-	// 复用全局 transport：模型同步与 Cline 对话同源（api.cline.bot），共用出口代理
-	client := &http.Client{Timeout: modelSyncTimeout, Transport: httpTransport}
-	resp, err := client.Get(clineRecommendedModelsURL)
-	if err != nil {
-		return clineRecommendedResponse{}, fmt.Errorf("fetch models: %w", err)
+	// 使用与 Cline 对话相同的请求级路由。Resin 出口质量有波动时，
+	// 有限换会话重试，避免一次 403/5xx 让启动同步直接退回旧目录。
+	client := &http.Client{Timeout: modelSyncTimeout, Transport: httpClient.Transport}
+	attempts := 1
+	if _, strategy := snapshotClineProxyConfig(); strategy == resinProxyStrategy {
+		attempts = 4
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return clineRecommendedResponse{}, fmt.Errorf("models API returned status %d", resp.StatusCode)
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, err := client.Get(clineRecommendedModelsURL)
+		if err != nil {
+			lastErr = fmt.Errorf("fetch models: %w", err)
+		} else if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("models API returned status %d", resp.StatusCode)
+		} else {
+			var data clineRecommendedResponse
+			err = json.NewDecoder(resp.Body).Decode(&data)
+			resp.Body.Close()
+			if err == nil {
+				return data, nil
+			}
+			lastErr = fmt.Errorf("decode models: %w", err)
+		}
+		if attempt < attempts {
+			log.Printf("models sync Resin attempt %d/%d failed: %v; rotating exit", attempt, attempts, lastErr)
+		}
 	}
-
-	var data clineRecommendedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return clineRecommendedResponse{}, fmt.Errorf("decode models: %w", err)
-	}
-	return data, nil
+	return clineRecommendedResponse{}, lastErr
 }
 
 // remoteCost 判断远程模型计费：tags 含 "FREE" 或来自 free 数组 → free，否则 pass。
