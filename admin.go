@@ -1425,15 +1425,11 @@ func handleOpenCodeConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := getZenConfig()
-	maskedProxies := make([]string, 0, len(cfg.Proxies))
-	for _, p := range cfg.Proxies {
-		maskedProxies = append(maskedProxies, maskProxyURL(p))
-	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"enabled":         cfg.Enabled,
 		"key":             cfg.Key,
 		"baseURL":         cfg.BaseURL,
-		"proxies":         maskedProxies,
+		"proxies":         append([]string(nil), cfg.Proxies...),
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"proxyCooldowns":  zenProxyCooldownStatus(),
 		"maxConcurrency":  cfg.MaxConcurrency,
@@ -1590,19 +1586,15 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "opencode_config_saved")})
 }
 
-// GET /admin/api/cline-proxy/config — Cline 出口代理配置（代理地址脱敏返回）
+// GET /admin/api/cline-proxy/config — Cline 出口代理配置
 func handleClineProxyConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
 		return
 	}
 	cfg := getClineProxyConfig()
-	maskedProxies := make([]string, 0, len(cfg.Proxies))
-	for _, p := range cfg.Proxies {
-		maskedProxies = append(maskedProxies, maskProxyURL(p))
-	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"proxies":       maskedProxies,
+		"proxies":       append([]string(nil), cfg.Proxies...),
 		"proxyStrategy": cfg.ProxyStrategy,
 	}})
 }
