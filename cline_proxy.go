@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
 // ============================================================================
@@ -45,9 +47,10 @@ func getClineProxyConfig() *clineProxyConfigData {
 	defer clineProxyCfgMu.Unlock()
 	if clineProxyCfg == nil {
 		cfg := defaultClineProxyConfig()
-		if data, err := os.ReadFile(resolveDataPath(".cline-proxy.json")); err == nil {
+		proxyPath := resolveDataPath(".cline-proxy.json")
+		if data, err := os.ReadFile(proxyPath); err == nil {
 			if err := json.Unmarshal(data, cfg); err != nil {
-				log.Printf("cline proxy config parse failed: %v", err)
+				backupCorruptFile(proxyPath, err)
 			}
 		}
 		normalizeClineProxyConfig(cfg)
@@ -82,7 +85,7 @@ func setClineProxyConfig(c *clineProxyConfigData) {
 	clineProxyCfgMu.Unlock()
 
 	data, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(resolveDataPath(".cline-proxy.json"), data, 0600); err != nil {
+	if err := writeFileAtomic(resolveDataPath(".cline-proxy.json"), data, 0600); err != nil {
 		log.Printf("cline proxy config save failed: %v", err)
 		setClineProxyPersistErr(err)
 		return
@@ -203,9 +206,16 @@ func clineDirectRequest(req *http.Request) bool {
 	return clineDirectDialHost(host)
 }
 
-// clineEnvProxy 环境变量代理回退（可注入接缝，测试用替身避免污染
-// http.ProxyFromEnvironment 的进程级缓存）。
-var clineEnvProxy = http.ProxyFromEnvironment
+// clineEnvProxy 环境变量代理回退（可注入接缝，测试用替身）。
+//
+// 不用 http.ProxyFromEnvironment：它在进程内首次调用时就把环境变量缓存住，
+// 此后任何修改（t.Setenv / 运行期改环境）都不再生效——只要先发生过一次出站
+// 请求，代理配置就被永久冻结在那一刻（实测导致 TestHTTPTransportUsesHTTPSProxy-
+// FromEnvironment 顺序相关地失败）。x/net/http/httpproxy 与标准库同一实现，
+// 但每次实时读取环境，语义一致、无进程级缓存。
+var clineEnvProxy = func(req *http.Request) (*url.URL, error) {
+	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+}
 
 // clineOutboundProxy 作为全局 transport 的 Proxy 钩子：应用内代理池生效时禁用
 // 环境变量代理（隧道在 DialContext 内建立，叠加会双重代理），否则维持原行为。

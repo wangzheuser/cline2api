@@ -315,6 +315,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, reqLo
 					var obj map[string]any
 					if json.Unmarshal([]byte(payload), &obj) == nil {
 						obj = unwrapDataEnvelope(obj)
+						if reqLog != nil {
+							restoreToolCallsInResponse(obj, reqLog.toolNames)
+						}
 						if m, ok := obj["model"].(string); ok && m != "" {
 							s.model = m
 						}
@@ -479,6 +482,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := params["stream"].(bool)
 	log.Printf("  responses: model=%s stream=%v", model, isStream)
 
+	// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+	if model != "" && isModelDisabled(model) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "model " + model + " is disabled",
+		})
+		return
+	}
+
 	reqLog := RequestLog{StartedAt: time.Now(), Protocol: "responses", Model: model, Stream: isStream}
 
 	chat := responsesToChat(params)
@@ -508,10 +519,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		upResp, err := callZenAPI(chat, isStream)
 		if err != nil {
+			// zen 故障转移到 Cline 池：先截短超长工具名（Meta 后端硬限 ≤64）
+			reqLog.toolNames = clampParamsToolNames(chat)
 			if fbResp, fbAcc, fbErr, attempted := zenFailoverToCline(chat, isStream); attempted {
 				if fbErr == nil {
 					log.Printf("  responses failover: serving %q via cline pool", chatModel)
-					reqLog.Upstream = upstreamCline
+					stampUpstream(&reqLog, chat) // 归因实际服务方（provider / cline）
 					if fm, ok := chat["model"].(string); ok && fm != "" {
 						reqLog.Model = fm // zen 故障转移后记录实际服务模型
 					}
@@ -536,13 +549,16 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					out2 := normalizeOpenAIResponse(unwrapDataEnvelope(raw))
+					restoreToolCallsInResponse(out2, reqLog.toolNames)
 					usage := parseTokenUsage(out2["usage"])
 					recordTokenUsage(fbAcc, reqLog.Model, usage)
 					finalizeRequestLog(&reqLog, usage, time.Time{}, reqLog.StartedAt, true, "")
 					writeJSON(w, http.StatusOK, chatToResponses(out2))
 					return
 				}
-				err = fbErr
+				// 兜底也失败：zen 的真实失败原因不能被吞 —— 最终错误带上两段，
+				// 日志/UI 能直接看到 zen 为什么挂、Cline 兜底为什么也没接住
+				err = fmt.Errorf("zen: %v; cline free chain: %w", err, fbErr)
 			}
 			log.Printf("  responses api error: %v", err)
 			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())
@@ -574,13 +590,16 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, chatToResponses(out2))
 
 	default: // cline
-		reqLog.Upstream = upstreamCline
+		// Cline 通道：截短超长工具名并记录映射，回程由响应处理器还原（Meta 后端硬限 ≤64）
+		reqLog.toolNames = clampParamsToolNames(chat)
 		upResp, acc, err := callClineAPI(chat, isStream)
 		if effectiveModel, ok := chat["model"].(string); ok && effectiveModel != "" {
 			reqLog.Model = effectiveModel // 含回退后的实际服务模型
-			if _, isZen := resolveZenInfo(effectiveModel); isZen {
-				reqLog.Upstream = upstreamOpenCode // zen 反向故障转移后归因 opencode
-			}
+		}
+		stampUpstream(&reqLog, chat) // 归因实际服务方（provider / opencode / cline）
+		if acc != nil {
+			reqLog.AccountID = acc.AccountID
+			reqLog.AccountEmail = acc.Email // 失败也要记账号：否则日志显示不出实际被 402/429 的账号
 		}
 		if err != nil {
 			log.Printf("  responses api error: %v", err)
@@ -614,6 +633,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out2 := normalizeOpenAIResponse(unwrapDataEnvelope(raw))
+		restoreToolCallsInResponse(out2, reqLog.toolNames)
 		usage := parseTokenUsage(out2["usage"])
 		if acc != nil {
 			recordTokenUsage(acc, reqLog.Model, usage)

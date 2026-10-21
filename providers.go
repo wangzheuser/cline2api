@@ -64,7 +64,7 @@ func loadProviders() {
 	}
 	var list []*CustomProvider
 	if err := json.Unmarshal(data, &list); err != nil {
-		log.Printf("providers parse failed: %v", err)
+		backupCorruptFile(providersFilePath, err)
 		return
 	}
 	customProviders = list
@@ -75,7 +75,7 @@ func saveProvidersLocked() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(providersFilePath, data, 0600); err != nil {
+	if err := writeFileAtomic(providersFilePath, data, 0600); err != nil {
 		log.Printf("providers save failed: %v", err)
 	}
 }
@@ -223,6 +223,19 @@ func callProvider(p *CustomProvider, params map[string]any, stream bool) (*http.
 	if mt, ok := body["max_completion_tokens"].(float64); ok && mt < minUpstreamMaxTokens {
 		log.Printf("  provider clamp max_completion_tokens=%d -> %d (upstream requires >= %d)", int(mt), defaultMaxTokens, minUpstreamMaxTokens)
 		body["max_completion_tokens"] = defaultMaxTokens
+	}
+	// 与 buildUpstreamBody 对称：按模型已知硬上限封顶（gemini-3.8-flash 等）
+	if modelID, _ := body["model"].(string); modelID != "" {
+		if limit := modelMaxOutputLimit(modelID); limit > 0 {
+			if mt, ok := body["max_tokens"].(float64); ok && mt > float64(limit) {
+				log.Printf("  provider clamp max_tokens=%d -> %d (model %q output limit)", int(mt), limit, modelID)
+				body["max_tokens"] = float64(limit)
+			}
+			if mt, ok := body["max_completion_tokens"].(float64); ok && mt > float64(limit) {
+				log.Printf("  provider clamp max_completion_tokens=%d -> %d (model %q output limit)", int(mt), limit, modelID)
+				body["max_completion_tokens"] = float64(limit)
+			}
+		}
 	}
 
 	bodyJSON, err := json.Marshal(body)

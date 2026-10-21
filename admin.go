@@ -91,6 +91,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/add", auth(handleAdminModelAdd))
 	mux.HandleFunc("/admin/api/models/delete", auth(handleAdminModelDelete))
 	mux.HandleFunc("/admin/api/models/context", auth(handleAdminModelContext))
+	mux.HandleFunc("/admin/api/models/toggle", auth(handleAdminModelToggle))
 	mux.HandleFunc("/admin/api/config", auth(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", auth(handleAdminUpdateConfig))
 	mux.HandleFunc("/admin/api/providers", auth(handleProvidersList))
@@ -699,20 +700,43 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /admin/api/accounts/export — 导出账号为批量导入兼容格式
+// POST body: { ids: [accountId...] } — 仅导出勾选的账号（管理页勾选导出）
 func handleExportAccounts(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != "GET" && r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
 		return
 	}
 
 	p := loadPool()
+	want := map[string]bool{}
+	if r.Method == "POST" {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
+		}
+		defer r.Body.Close()
+		var req struct {
+			IDs []string `json:"ids"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_json")})
+			return
+		}
+		for _, id := range req.IDs {
+			if id != "" {
+				want[id] = true
+			}
+		}
+	}
+
 	type exportToken struct {
 		RefreshToken string `json:"refreshToken"`
 		Email        string `json:"email"`
 	}
 	tokens := make([]exportToken, 0, len(p.Accounts))
 	for _, acc := range p.Accounts {
-		if acc.RefreshToken != "" {
+		if acc.RefreshToken != "" && (len(want) == 0 || want[acc.AccountID]) {
 			tokens = append(tokens, exportToken{
 				RefreshToken: acc.RefreshToken,
 				Email:        acc.Email,
@@ -894,12 +918,12 @@ func defaultProxyConfig() *proxyConfigData {
 const proxyConfigPath = ".cline-config.json"
 
 // loadProxyConfigFromDisk 启动时加载持久化的代理配置（轮询策略/请求头），
-// 文件不存在或损坏时回退默认值。resolveDataPath 为纯函数，包级初始化安全。
+// 文件不存在或损坏时回退默认值（损坏文件改名备份，不静默覆盖）。
 func loadProxyConfigFromDisk() *proxyConfigData {
 	cfg := defaultProxyConfig()
 	if data, err := os.ReadFile(resolveDataPath(proxyConfigPath)); err == nil {
 		if err := json.Unmarshal(data, cfg); err != nil {
-			log.Printf("proxy config parse failed: %v", err)
+			backupCorruptFile(resolveDataPath(proxyConfigPath), err)
 		}
 	}
 	switch cfg.Strategy {
@@ -916,7 +940,7 @@ func saveProxyConfigLocked() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(resolveDataPath(proxyConfigPath), data, 0600); err != nil {
+	if err := writeFileAtomic(resolveDataPath(proxyConfigPath), data, 0600); err != nil {
 		log.Printf("proxy config save failed: %v", err)
 	}
 }
@@ -1019,6 +1043,8 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	var chainUnverified []string // 回退链中不在可用列表的条目（保存后回显提示）
+
 	var req struct {
 		Strategy     string            `json:"strategy"`
 		Headers      map[string]string `json:"headers"`
@@ -1055,12 +1081,15 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ModelChain != nil {
-		// 校验回退链：允许 "free" 别名或存在的模型 ID；去空去重
+		// 回退链：去空去重，允许不在可用列表里的模型 ID —— 官方列表之外
+		// 仍有实测可用的模型（同步列表只是参考，不是白名单）；失效条目由
+		// 请求时的模型级冷却与故障转移兜底。不在列表的条目回显给前端提示。
 		known := map[string]bool{"free": true}
 		for _, m := range getAllModels() {
 			known[m.ID] = true
 		}
 		var chain []string
+		var unverified []string
 		seen := map[string]bool{}
 		for _, raw := range *req.ModelChain {
 			id := strings.TrimSpace(raw)
@@ -1068,14 +1097,17 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if !known[id] {
-				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("unknown model in modelChain: %s", id)})
-				return
+				unverified = append(unverified, id)
 			}
 			seen[id] = true
 			chain = append(chain, id)
 		}
 		cfg.ModelChain = chain
+		if len(unverified) > 0 {
+			log.Printf("  model chain: kept out-of-list model(s) %v (not in synced list, may still work)", unverified)
+		}
 		changed = true
+		chainUnverified = unverified
 	}
 
 	if req.OnlyFree != nil {
@@ -1140,13 +1172,14 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"strategy":      cfg.Strategy,
-		"headers":       cfg.Headers,
-		"onlyFree":      cfg.OnlyFree,
-		"defaultModel":  getDefaultModel(),
-		"host":          listenHost,
-		"address":       fmt.Sprintf("%s:%d", effectiveAdminHost(listenHost), listenPort),
-		"restarting":    restarting,
+		"strategy":         cfg.Strategy,
+		"headers":          cfg.Headers,
+		"onlyFree":         cfg.OnlyFree,
+		"defaultModel":     getDefaultModel(),
+		"host":             listenHost,
+		"address":          fmt.Sprintf("%s:%d", effectiveAdminHost(listenHost), listenPort),
+		"restarting":       restarting,
+		"chainUnverified":  chainUnverified,
 	}})
 }
 
@@ -1263,8 +1296,8 @@ func handleAdminModelDelete(w http.ResponseWriter, r *http.Request) {
 		found := false
 		for i, m := range p.Models {
 			if m.ID == req.ID {
-				// 仅允许删除自定义模型
-				if !m.Custom {
+				// 自定义模型可删；同步打上 Delisted 标记的下架模型支持手动移除
+				if !m.Custom && !m.Delisted {
 					poolMu.Unlock()
 					writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "cannot_delete_builtin")})
 					return
@@ -1343,6 +1376,68 @@ func handleAdminModelContext(w http.ResponseWriter, r *http.Request) {
 	savePool()
 	log.Printf("  model context updated: %s ctx=%d out=%d", req.ID, req.Context, req.Output)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "model_context_saved")})
+}
+
+// POST /admin/api/models/toggle  body: { ids: [...], disabled }
+// 启用/停用模型（单个或批量）：停用后不进客户端模型列表、直接请求被拒绝、
+// 默认模型与回退链自动跳过；同步保留该标记。停用当前默认模型时清空默认。
+func handleAdminModelToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		IDs      []string `json:"ids"`
+		Disabled bool     `json:"disabled"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_json")})
+		return
+	}
+	ids := make([]string, 0, len(req.IDs))
+	for _, id := range req.IDs {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "model_id_required")})
+		return
+	}
+
+	target := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		target[id] = true
+	}
+	p := loadPool()
+	poolMu.Lock()
+	changed := 0
+	for i, m := range p.Models {
+		if !target[m.ID] {
+			continue
+		}
+		p.Models[i].Disabled = req.Disabled
+		changed++
+		// 停用当前默认模型时清空，回退到自动挑选逻辑（与删除行为一致）
+		if req.Disabled && p.DefaultModel == m.ID {
+			p.DefaultModel = ""
+		}
+	}
+	poolMu.Unlock()
+	if changed == 0 {
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: tAPI(r, "model_not_found")})
+		return
+	}
+	savePool()
+	log.Printf("  model toggle: %d models -> disabled=%v", changed, req.Disabled)
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "model_status_saved")})
 }
 
 // GET /admin/api/stats
@@ -1437,6 +1532,7 @@ func handleOpenCodeConfig(w http.ResponseWriter, r *http.Request) {
 		"failover":        cfg.Failover,
 		"failoverCount":   cfg.FailoverCount,
 		"failoverMinutes": cfg.FailoverMinutes,
+		"zenHeaders":      cfg.ZenHeaders,
 		"compaction":      cfg.Compaction,
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
